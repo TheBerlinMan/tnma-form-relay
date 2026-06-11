@@ -116,6 +116,50 @@ export async function getRetryable(maxAttempts: number): Promise<RetryableSubmis
   }));
 }
 
+export interface WeeklyStat {
+  formId: string;
+  status: string;
+  count: number;
+}
+
+/** Submission counts per form and status over the trailing 7 days. */
+export async function getWeeklyStats(): Promise<WeeklyStat[]> {
+  const db = getSql();
+  if (!db) return [];
+  const rows = await db`
+    SELECT form_id, status, count(*)::int AS count
+    FROM submissions
+    WHERE created_at > now() - interval '7 days'
+    GROUP BY form_id, status
+    ORDER BY form_id
+  `;
+  return rows.map((r) => ({
+    formId: r.form_id as string,
+    status: r.status as string,
+    count: r.count as number,
+  }));
+}
+
+/** Rows the retry cron has given up on — they need manual attention. */
+export async function getExhausted(maxAttempts: number): Promise<
+  { id: string; formId: string; createdAt: string }[]
+> {
+  const db = getSql();
+  if (!db) return [];
+  const rows = await db`
+    SELECT id, form_id, created_at
+    FROM submissions
+    WHERE status = 'failed' AND attempts >= ${maxAttempts}
+    ORDER BY created_at DESC
+    LIMIT 20
+  `;
+  return rows.map((r) => ({
+    id: r.id as string,
+    formId: r.form_id as string,
+    createdAt: String(r.created_at),
+  }));
+}
+
 /**
  * Updates a row from a Resend webhook event. Returns the affected row's id
  * and form_id, or null when no row matches (e.g. emails sent before Phase 2).

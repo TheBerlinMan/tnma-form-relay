@@ -4,7 +4,15 @@ import { formRegistry } from './config/forms.js';
 import { validateSubmission } from './lib/validate.js';
 import { checkSpam } from './lib/spam.js';
 import { sendNotification } from './lib/email.js';
-import { logSubmission, markSent, markFailed, getRetryable, setStatusByEmailId } from './lib/db.js';
+import {
+  logSubmission,
+  markSent,
+  markFailed,
+  getRetryable,
+  setStatusByEmailId,
+  getWeeklyStats,
+  getExhausted,
+} from './lib/db.js';
 import { sendAlert } from './lib/alert.js';
 import { isRateLimited, cleanupRateLimits } from './lib/ratelimit.js';
 import { verifyWebhookSignature } from './lib/webhook.js';
@@ -198,6 +206,47 @@ app.get('/cron/retry', async (c) => {
   }
 
   return c.json({ ok: true, eligible: rows.length, sent, failed });
+});
+
+// ── Weekly digest (Vercel Cron, Mondays): per-form counts + stuck rows ──────
+app.get('/cron/digest', async (c) => {
+  const secret = process.env.CRON_SECRET;
+  if (secret && c.req.header('authorization') !== `Bearer ${secret}`) {
+    return c.json({ ok: false }, 401);
+  }
+
+  const stats = await getWeeklyStats();
+  const exhausted = await getExhausted(MAX_SEND_ATTEMPTS);
+
+  const byForm = new Map<string, Record<string, number>>();
+  for (const s of stats) {
+    const counts = byForm.get(s.formId) ?? {};
+    counts[s.status] = s.count;
+    byForm.set(s.formId, counts);
+  }
+
+  const lines: string[] = [];
+  if (byForm.size === 0) {
+    lines.push('No submissions in the past 7 days.');
+  } else {
+    for (const [formId, counts] of byForm) {
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      const parts = ['sent', 'pending', 'failed', 'bounced']
+        .filter((s) => counts[s])
+        .map((s) => `${counts[s]} ${s}`);
+      lines.push(`${formId}: ${total} submission${total === 1 ? '' : 's'} — ${parts.join(', ')}`);
+    }
+  }
+  if (exhausted.length > 0) {
+    lines.push('');
+    lines.push(`NEEDS ATTENTION — gave up after ${MAX_SEND_ATTEMPTS} attempts:`);
+    for (const row of exhausted) {
+      lines.push(`  ${row.id} (${row.formId}, ${row.createdAt}) — npm run lookup -- --resend ${row.id}`);
+    }
+  }
+
+  await sendAlert('Weekly digest', lines);
+  return c.json({ ok: true, forms: byForm.size, exhausted: exhausted.length });
 });
 
 export default app;

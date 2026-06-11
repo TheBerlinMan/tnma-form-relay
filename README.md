@@ -2,60 +2,26 @@
 
 Internal form backend for agency client sites. Receives form POSTs, validates
 and filters them, and delivers branded notification emails to client inboxes
-via Resend. Replaces Formspree/FormSubmit with something we own.
+via Resend. 
 
 **Stack:** Hono on a single Vercel function (Node runtime) · Resend + React
-Email · Cloudflare Turnstile (Phase 3) · Neon Postgres (Phase 2).
-
-## Project layout
-
-```
-api/index.ts            Vercel entry — wraps the Hono app
-src/app.ts              Routes: GET /healthz, POST /f/:formId
-src/config/forms.ts     ★ Form registry — add new forms here
-src/lib/validate.ts     zod validation from field config + subject templating
-src/lib/spam.ts         Honeypot, URL-density, Turnstile (env-gated)
-src/lib/email.ts        React Email render + Resend send
-src/lib/db.ts           Submission log (v0 stub → Neon in Phase 2)
-emails/                 React Email templates
-shopify/                Reusable Liquid form snippet for client themes
-```
+Email · Cloudflare Turnstile · Neon Postgres.
 
 ## Setup
 
 1. `npm install`
-2. Copy `.env.example` → `.env` and fill `RESEND_API_KEY` and `MAIL_FROM`
-   (the From address must be on the verified sending subdomain).
-3. Local dev: `npm start` (uses `vercel dev`; add the env vars when prompted
-   or via `vercel env`). Don't name this script `dev` — `vercel dev` runs a
-   package.json `dev` script as the project's Development Command, which
-   would recurse.
-4. Preview email templates while editing: `npm run email:preview`.
+2. Local dev: `npm start`
+3. Preview email templates while editing: `npm run email:preview`.
+
 
 ## Deploy
 
 ```
-vercel deploy --prod
+npx vercel env pull
+npx vercel env set RESEND_API_KEY <your-resend-api-key>
+npx vercel env set MAIL_FROM <your-mail-from>
+npx vercel deploy --prod
 ```
-
-Set `RESEND_API_KEY` and `MAIL_FROM` in the Vercel project (Settings →
-Environment Variables) before the first deploy. Point a nice domain at the
-project if desired (e.g. `forms.youragency.com`).
-
-## Smoke test
-
-```bash
-curl -X POST https://<your-deployment>/f/demo-contact \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  -d '{"name":"Test Person","email":"test@example.com","message":"Hello from the smoke test"}'
-```
-
-Expected: `{"ok":true}` and a styled email in the `to:` inbox configured for
-`demo-contact`. Reply-To should be `test@example.com`.
-
-An HTML-form submission (no JSON headers) instead 302-redirects to the form's
-`redirectUrl`.
 
 ## Adding a new form (≈15 min runbook)
 
@@ -73,28 +39,70 @@ An HTML-form submission (no JSON headers) instead 302-redirects to the form's
    contacts (or whitelist the domain org-wide in Workspace/M365).
 5. Submit a real test from the live site; confirm inbox placement.
 
-## Rules that never change
+## Querying the submission log
 
-- Visitor email goes in **Reply-To**, never **From** (DMARC/spoofing).
-- All sending happens from the authenticated subdomain.
-- Spam checks return **fake success** — never reveal detection to bots.
-- Only declared fields are forwarded; unknown fields are dropped.
-- No tracking, no shorteners, correspondence-style templates only.
+`npm run lookup` is a local CLI over the Neon `submissions` table — it answers
+"did we get that form on the 14th?" without opening the Neon console. It reads
+`DATABASE_URL` (and, for `--resend`, `CRON_SECRET`) from `.env`. Everything is
+read-only except `--resend`. Run `npm run lookup -- --help` for a cheat sheet.
 
-## Roadmap
+### Listing and filtering
 
-- **Phase 2 — durability:** shipped. Submissions are logged to Neon before the
-  send (schema in `src/lib/db.ts`); failed sends return success to the visitor
-  and are retried by `/cron/retry` (max 3 attempts, then an alert to
-  `ALERT_EMAIL`). Vercel Cron triggers it daily at 09:00 UTC (Hobby-plan
-  limit — for 15-min cadence use Pro or any external pinger sending
-  `Authorization: Bearer $CRON_SECRET`). Bounce/failure/complaint events arrive
-  signed at `/webhooks/resend` (verified against `RESEND_WEBHOOK_SECRET`) and
-  update the row + alert `ALERT_EMAIL`; bounced addresses are never retried.
-- **Phase 3 — abuse:** shipped. Per-IP/per-form rate limiting (10 per 10 min,
-  Neon-backed, checked before anything is logged), honeypot, URL-density
-  heuristics — all spam gets a fake success. Turnstile is verified and ready:
-  pass `turnstile_site_key` to the Liquid snippet and set
-  `TURNSTILE_SECRET_KEY` in the deployment, together, at go-live.
-- **Phase 4 — first client:** branded template per client, mail-tester ≥ 9,
-  Google Postmaster registration.
+```bash
+npm run lookup                                  # latest 20 submissions, all forms
+npm run lookup -- --form tnma-contact           # one form only
+npm run lookup -- --status failed               # pending | sent | failed | bounced
+npm run lookup -- --since 2026-06-08            # on/after a date
+npm run lookup -- --since 2026-06-01 --until 2026-06-14   # inclusive date range
+npm run lookup -- --search maria                # text search across the payload
+npm run lookup -- --limit 50                    # more rows (capped at 200)
+```
+
+Flags combine freely, e.g. `--form tnma-contact --status failed --since
+2026-06-01`. Output is a table: id, form, status, attempt count, created
+timestamp, sender name/email, and the start of the message.
+
+### Full detail for one submission
+
+```bash
+npm run lookup -- --id <uuid>
+```
+
+Prints the complete stored payload plus timestamps and the Resend email id.
+Paste that Resend id into the Resend dashboard (Emails → search) to see the
+provider-side delivery log for that exact message.
+
+### Re-sending a submission
+
+```bash
+npm run lookup -- --resend <uuid>
+```
+
+For rows the retry cron gave up on — the "giving up" alert email contains this
+exact command with the right id filled in. It re-queues the row (status
+`failed`, attempts reset) and then calls the production `/cron/retry` endpoint
+with your `CRON_SECRET`, so the send happens through the real deployed
+pipeline — same registry entry, template, and From identity as a live
+submission. It finishes by printing the row again so you can see the new
+status (`sent` = recovered).
+
+Two safety rails refuse to proceed unless you add `--force`:
+
+- **status `sent`** — re-sending delivers a duplicate email to the client.
+- **status `bounced`** — the recipient address is bad; re-sending would hammer
+  it (deliverability rule 5). Fix the form's `to:` address first, deploy, and
+  only then `--force`.
+
+If the deployment ever moves off `form-relay-eta.vercel.app`, set
+`FORM_RELAY_URL=<new url>` in `.env` so `--resend` targets the right host.
+
+## Weekly digest
+
+`/cron/digest` (Vercel Cron, Mondays 09:00 UTC) emails `ALERT_EMAIL` a
+per-form summary of the trailing 7 days — submissions received, sent, failed,
+bounced — plus any rows the retry cron has given up on, each listed with its
+ready-to-paste `--resend` command. Trigger it manually anytime:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" https://form-relay-eta.vercel.app/cron/digest
+```
