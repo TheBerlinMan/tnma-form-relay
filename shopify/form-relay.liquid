@@ -1,0 +1,55 @@
+{% comment %}
+  Form Relay snippet — reusable contact form wired to the form-relay service.
+
+  Usage in a theme section/template:
+    {% render 'form-relay', form_id: 'robertas-contact', endpoint: 'https://forms.youragency.com', turnstile_site_key: '0x4AAA...' %}
+
+  Notes:
+  - The hidden "_honey" field is the honeypot. Keep it hidden via the inline
+    style AND off-screen positioning; do not rename it (must match the server).
+  - Pass turnstile_site_key to render the Turnstile widget. The server only
+    enforces tokens when TURNSTILE_SECRET_KEY is set in the deployment, so
+    enable both together: widget on the form + secret in the Vercel env.
+{% endcomment %}
+
+{% assign fr_endpoint = endpoint | default: 'https://forms.youragency.com' %}
+
+<form
+  class="form-relay"
+  method="POST"
+  action="{{ fr_endpoint }}/f/{{ form_id }}"
+  accept-charset="UTF-8"
+>
+  <div class="form-relay__field">
+    <label for="fr-name">Name</label>
+    <input id="fr-name" type="text" name="name" required maxlength="200" autocomplete="name">
+  </div>
+
+  <div class="form-relay__field">
+    <label for="fr-email">Email</label>
+    <input id="fr-email" type="email" name="email" required autocomplete="email">
+  </div>
+
+  <div class="form-relay__field">
+    <label for="fr-phone">Phone (optional)</label>
+    <input id="fr-phone" type="tel" name="phone" maxlength="40" autocomplete="tel">
+  </div>
+
+  <div class="form-relay__field">
+    <label for="fr-message">Message</label>
+    <textarea id="fr-message" name="message" required maxlength="5000" rows="5"></textarea>
+  </div>
+
+  {% comment %} Honeypot — invisible to humans, irresistible to bots {% endcomment %}
+  <div style="position:absolute;left:-9999px;opacity:0;height:0;overflow:hidden" aria-hidden="true">
+    <label for="fr-honey">Leave this field empty</label>
+    <input id="fr-honey" type="text" name="_honey" tabindex="-1" autocomplete="off">
+  </div>
+
+  {% if turnstile_site_key != blank %}
+  <div class="cf-turnstile" data-sitekey="{{ turnstile_site_key }}"></div>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  {% endif %}
+
+  <button type="submit">Send message</button>
+</form>
