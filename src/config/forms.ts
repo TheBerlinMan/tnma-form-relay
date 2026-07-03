@@ -46,6 +46,13 @@ export interface FormConfig {
    * Empty array = allow any origin (use only while testing).
    */
   allowedOrigins: string[];
+  /**
+   * Circuit breaker: max accepted submissions per rolling 24h. Requests past
+   * the cap get a fake success and you get one alert per day. Defaults to 200
+   * — far above any real form's volume; it exists to stop a distributed bot
+   * run from burning the Resend quota and the sender reputation.
+   */
+  dailyCap?: number;
   /** Declared fields. Unknown submitted fields are ignored, not forwarded. */
   fields: FieldConfig[];
   /**
@@ -83,6 +90,7 @@ const forms: FormConfig[] = [
     accentColor: '#8a3324',
     redirectUrl: 'https://example.com/thank-you',
     allowedOrigins: [], // empty while testing; lock down before go-live
+    dailyCap: 5, // smoke-test form — keep its blast radius tiny
     replyToField: 'email',
     fields: [
       { name: 'name', label: 'Name', type: 'text', required: true, maxLength: 200 },

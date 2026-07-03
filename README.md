@@ -96,13 +96,48 @@ Two safety rails refuse to proceed unless you add `--force`:
 If the deployment ever moves off `form-relay-eta.vercel.app`, set
 `FORM_RELAY_URL=<new url>` in `.env` so `--resend` targets the right host.
 
+## Abuse protection & limits
+
+Layered, in request order; every rejection returns a fake success so bots
+never learn they were caught:
+
+1. **Origin allowlist** — per form (`allowedOrigins`).
+2. **Per-IP rate limit** — 10 requests per IP per form per 10 minutes.
+3. **Honeypot** (`_honey`) and **URL-density** content check.
+4. **Turnstile** — enforced whenever `TURNSTILE_SECRET_KEY` is set.
+5. **Duplicate suppression** — an identical payload for the same form within
+   5 minutes (double-clicked Send, impatient retry) is acknowledged but not
+   re-emailed.
+6. **Daily circuit breaker** — max accepted submissions per form per rolling
+   24h (`dailyCap` in the form config, default 200; `demo-contact` is capped
+   at 5). Protects the Resend quota and sender reputation from distributed
+   attacks that rotate IPs. You get one alert email per day when a cap trips.
+
+Blocked requests are counted (form × reason × day, no content stored) in the
+`spam_events` table and reported in the weekly digest; counters are purged
+after 90 days.
+
 ## Weekly digest
 
 `/cron/digest` (Vercel Cron, Mondays 09:00 UTC) emails `ALERT_EMAIL` a
 per-form summary of the trailing 7 days — submissions received, sent, failed,
-bounced — plus any rows the retry cron has given up on, each listed with its
-ready-to-paste `--resend` command. Trigger it manually anytime:
+bounced — plus any rows the retry cron has given up on (each listed with its
+ready-to-paste `--resend` command) and a breakdown of blocked requests by
+reason. Trigger it manually anytime:
 
 ```bash
 curl -H "Authorization: Bearer $CRON_SECRET" https://form-relay-eta.vercel.app/cron/digest
 ```
+
+## Future Improvements
+
+- Style weekly email log
+- Per-client monthly summary email ("Your website forms received 23 inquiries
+  this month") sent to the client, not us — proves the service is working
+  during quiet weeks. Trivial variant of `/cron/digest`; build when the first
+  restaurant client is live.
+- PII hygiene: auto-purge submissions older than ~12 months from the
+  `submissions` table (one DELETE added to the existing cron cleanup). Less
+  stored personal data, less liability, and clients can be told their
+  visitors' messages aren't kept forever. Keep the row counts if the monthly
+  summaries should still report long-term totals.

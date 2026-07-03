@@ -12,12 +12,17 @@ import {
   setStatusByEmailId,
   getWeeklyStats,
   getExhausted,
+  hasRecentDuplicate,
+  countRecentSubmissions,
+  recordSpamEvent,
+  getSpamStats,
 } from './lib/db.js';
 import { sendAlert } from './lib/alert.js';
 import { isRateLimited, cleanupRateLimits } from './lib/ratelimit.js';
 import { verifyWebhookSignature } from './lib/webhook.js';
 
 const MAX_SEND_ATTEMPTS = 3;
+const DEFAULT_DAILY_CAP = 200;
 
 const app = new Hono().basePath('/');
 
@@ -71,12 +76,14 @@ app.post('/f/:formId', async (c) => {
     c.req.header('x-real-ip') ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
   if (await isRateLimited(form.id, ip)) {
     console.log(JSON.stringify({ event: 'spam-rejected', formId: form.id, reason: 'rate-limit' }));
+    await recordSpamEvent(form.id, 'rate-limit');
     return succeed();
   }
 
   const spam = await checkSpam(raw, ip);
   if (!spam.ok) {
     console.log(JSON.stringify({ event: 'spam-rejected', formId: form.id, reason: spam.reason }));
+    await recordSpamEvent(form.id, spam.reason ?? 'spam');
     return succeed();
   }
 
@@ -84,6 +91,29 @@ app.post('/f/:formId', async (c) => {
   const result = validateSubmission(form, raw as Record<string, unknown>);
   if (!result.ok) {
     return c.json({ ok: false, errors: result.errors }, 422);
+  }
+
+  // ── Duplicate suppression: a double-clicked Send or impatient retry with
+  // an identical payload within 5 minutes shouldn't email the client twice.
+  // The visitor still sees success — their message WAS received. ───────────
+  if (await hasRecentDuplicate(form.id, result.data)) {
+    console.log(JSON.stringify({ event: 'duplicate-suppressed', formId: form.id }));
+    return succeed();
+  }
+
+  // ── Daily circuit breaker: a distributed bot run that beats the per-IP
+  // limit still can't burn the Resend quota or the sender reputation. ──────
+  const dailyCap = form.dailyCap ?? DEFAULT_DAILY_CAP;
+  if ((await countRecentSubmissions(form.id)) >= dailyCap) {
+    const blocked = await recordSpamEvent(form.id, 'daily-cap');
+    if (blocked === 1) {
+      await sendAlert(`Daily cap hit for ${form.id}`, [
+        `The form accepted ${dailyCap} submissions in 24h and is now refusing more (fake success).`,
+        'If this is a real traffic spike, raise dailyCap in the form config and redeploy.',
+        'If it is an attack, the cap holds until volume drops below the limit.',
+      ]);
+    }
+    return succeed();
   }
 
   // ── Log durably BEFORE sending, then send ────────────────────────────────
@@ -245,8 +275,17 @@ app.get('/cron/digest', async (c) => {
     }
   }
 
+  const spamStats = await getSpamStats();
+  if (spamStats.length > 0) {
+    lines.push('');
+    lines.push('Blocked requests (last 7 days):');
+    for (const s of spamStats) {
+      lines.push(`  ${s.formId}: ${s.count} × ${s.reason}`);
+    }
+  }
+
   await sendAlert('Weekly digest', lines);
-  return c.json({ ok: true, forms: byForm.size, exhausted: exhausted.length });
+  return c.json({ ok: true, forms: byForm.size, exhausted: exhausted.length, blocked: spamStats.length });
 });
 
 export default app;

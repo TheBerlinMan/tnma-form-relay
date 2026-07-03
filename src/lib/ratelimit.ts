@@ -35,9 +35,10 @@ export async function isRateLimited(formId: string, ip: string | undefined): Pro
   }
 }
 
-/** Drops stale windows; called from the cron route. */
+/** Drops stale rate windows and old spam counters; called from the cron route. */
 export async function cleanupRateLimits(): Promise<void> {
   const db = getSql();
   if (!db) return;
   await db`DELETE FROM rate_limits WHERE window_start < now() - interval '1 day'`;
+  await db`DELETE FROM spam_events WHERE day < CURRENT_DATE - 90`;
 }

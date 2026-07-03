@@ -116,6 +116,83 @@ export async function getRetryable(maxAttempts: number): Promise<RetryableSubmis
   }));
 }
 
+/** True when an identical payload for this form arrived in the last 5 minutes
+ *  (double-clicked Send, impatient retry) — suppresses duplicate emails. */
+export async function hasRecentDuplicate(
+  formId: string,
+  payload: Record<string, string>
+): Promise<boolean> {
+  const db = getSql();
+  if (!db) return false;
+  const rows = await db`
+    SELECT 1 FROM submissions
+    WHERE form_id = ${formId}
+      AND payload = ${JSON.stringify(payload)}::jsonb
+      AND created_at > now() - interval '5 minutes'
+    LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+/** Submissions accepted for a form in the trailing 24h (daily circuit breaker). */
+export async function countRecentSubmissions(formId: string): Promise<number> {
+  const db = getSql();
+  if (!db) return 0;
+  const rows = await db`
+    SELECT count(*)::int AS n FROM submissions
+    WHERE form_id = ${formId} AND created_at > now() - interval '24 hours'
+  `;
+  return (rows[0] as { n: number }).n;
+}
+
+/**
+ * Bumps the per-day counter for a rejected request (no content stored) and
+ * returns the new count — 1 means this is the first such block today, which
+ * callers can use to alert exactly once. Never throws: visibility must not
+ * break the fake-success path.
+ */
+export async function recordSpamEvent(formId: string, reason: string): Promise<number> {
+  const db = getSql();
+  if (!db) return 0;
+  try {
+    const rows = await db`
+      INSERT INTO spam_events (form_id, reason, day, count)
+      VALUES (${formId}, ${reason}, CURRENT_DATE, 1)
+      ON CONFLICT (form_id, reason, day)
+      DO UPDATE SET count = spam_events.count + 1
+      RETURNING count
+    `;
+    return (rows[0] as { count: number }).count;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'spam-event-record-failed', error: String(err) }));
+    return 0;
+  }
+}
+
+export interface SpamStat {
+  formId: string;
+  reason: string;
+  count: number;
+}
+
+/** Blocked-request totals per form and reason over the trailing 7 days. */
+export async function getSpamStats(): Promise<SpamStat[]> {
+  const db = getSql();
+  if (!db) return [];
+  const rows = await db`
+    SELECT form_id, reason, sum(count)::int AS count
+    FROM spam_events
+    WHERE day > CURRENT_DATE - 7
+    GROUP BY form_id, reason
+    ORDER BY form_id, count DESC
+  `;
+  return rows.map((r) => ({
+    formId: r.form_id as string,
+    reason: r.reason as string,
+    count: r.count as number,
+  }));
+}
+
 export interface WeeklyStat {
   formId: string;
   status: string;
