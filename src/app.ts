@@ -1,9 +1,15 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { formRegistry } from './config/forms.js';
+import { formRegistry, waitlistEmailField } from './config/forms.js';
 import { validateSubmission } from './lib/validate.js';
 import { checkSpam } from './lib/spam.js';
-import { sendNotification } from './lib/email.js';
+import {
+  sendNotification,
+  sendAutoReply,
+  sendWaitlistThanks,
+  isAutoReplySafe,
+} from './lib/email.js';
+import { syncAudienceContact, removeAudienceContact } from './lib/waitlist.js';
 import {
   logSubmission,
   markSent,
@@ -16,6 +22,14 @@ import {
   countRecentSubmissions,
   recordSpamEvent,
   getSpamStats,
+  setAutoReplyEmailId,
+  findByAutoReplyEmailId,
+  hasWaitlistSignup,
+  insertWaitlistSignup,
+  markContactSynced,
+  getUnsyncedSignups,
+  countWaitlistSignups,
+  deleteWaitlistSignup,
 } from './lib/db.js';
 import { sendAlert } from './lib/alert.js';
 import { isRateLimited, cleanupRateLimits } from './lib/ratelimit.js';
@@ -116,11 +130,64 @@ app.post('/f/:formId', async (c) => {
     return succeed();
   }
 
+  // ── Waitlist: durable list row first (membership is the point), audience
+  // sync second (retryable via the cron sweep), thanks email last (retryable
+  // via the existing submissions machinery). ───────────────────────────────
+  if (form.kind === 'waitlist') {
+    const waitlist = form.waitlist!;
+    const email = result.data[waitlistEmailField(form)].toLowerCase();
+    const name = result.data.name;
+
+    // Role addresses (noreply@ etc.) have no human behind them — pointless on
+    // a mailing list and a backscatter risk. Silent success, nothing stored.
+    if (!isAutoReplySafe(email)) {
+      console.log(JSON.stringify({ event: 'waitlist-role-address', formId: form.id }));
+      return succeed();
+    }
+
+    // One thanks email per address, EVER: a repeat signup is a silent success
+    // with no re-send, so the endpoint can't be used to blast a third party's
+    // inbox from our authenticated domain. The code is static — they lost
+    // nothing.
+    if (await hasWaitlistSignup(form.id, email)) {
+      console.log(JSON.stringify({ event: 'waitlist-duplicate', formId: form.id }));
+      return succeed();
+    }
+
+    const signupId = await insertWaitlistSignup(form.id, email, name);
+    if (signupId && (await syncAudienceContact(waitlist.audienceId, email, name))) {
+      await markContactSynced(signupId); // failure → /cron/retry sweep
+    }
+
+    const submissionId = await logSubmission(form.id, result.data);
+    try {
+      const emailId = await sendWaitlistThanks(form, result.data);
+      await markSent(submissionId, emailId);
+    } catch (err) {
+      await markFailed(submissionId); // /cron/retry re-attempts, max 3
+      console.error(JSON.stringify({ event: 'send-failed', submissionId, error: String(err) }));
+    }
+    return succeed();
+  }
+
   // ── Log durably BEFORE sending, then send ────────────────────────────────
   const submissionId = await logSubmission(form.id, result.data);
   try {
     const emailId = await sendNotification(form, result.data, submissionId);
     await markSent(submissionId, emailId);
+
+    // Auto-reply: best-effort, ONE attempt, only after the notification
+    // succeeded. No cron retry — a days-late confirmation is worse than none.
+    const visitorEmail = form.replyToField ? result.data[form.replyToField] : undefined;
+    if (form.autoReply && visitorEmail && isAutoReplySafe(visitorEmail)) {
+      try {
+        await setAutoReplyEmailId(submissionId, await sendAutoReply(form, result.data));
+      } catch (err) {
+        console.error(
+          JSON.stringify({ event: 'auto-reply-failed', submissionId, error: String(err) })
+        );
+      }
+    }
   } catch (err) {
     await markFailed(submissionId);
     console.error(JSON.stringify({ event: 'send-failed', submissionId, error: String(err) }));
@@ -159,9 +226,44 @@ app.post('/webhooks/resend', async (c) => {
   const emailId = event.data?.email_id;
   switch (event.type) {
     case 'email.bounced': {
-      // Bounced = bad address. Mark it so retries never hammer it (rule 5);
-      // the fix is a human one: correct the recipient in the form config.
+      // Auto-reply bounce = the VISITOR's address is bad. The client
+      // notification was delivered fine, so the submission status stays
+      // untouched — there is nothing to fix in the form config.
+      const autoReplyRow = emailId ? await findByAutoReplyEmailId(emailId) : null;
+      if (autoReplyRow) {
+        await sendAlert('Auto-reply bounced (visitor address is bad)', [
+          `To: ${event.data?.to?.join(', ') ?? 'unknown'}`,
+          `Submission: ${autoReplyRow.id} (form ${autoReplyRow.formId})`,
+          'The visitor mistyped their email — nothing to fix in the form config.',
+        ]);
+        break;
+      }
+
+      // Bounced = bad address. Mark it so retries never hammer it (rule 5).
       const row = emailId ? await setStatusByEmailId(emailId, 'bounced') : null;
+
+      // Waitlist thanks bounce = also a visitor address. Rule 5 again: pull
+      // it from the list and the Audience so a future Broadcast never
+      // hammers it. A later re-signup with a working mailbox is welcome.
+      const form = row ? formRegistry[row.formId] : undefined;
+      if (row && form?.kind === 'waitlist') {
+        const visitorEmail = event.data?.to?.[0]?.toLowerCase();
+        if (visitorEmail) {
+          await deleteWaitlistSignup(row.formId, visitorEmail);
+          if (form.waitlist) {
+            await removeAudienceContact(form.waitlist.audienceId, visitorEmail);
+          }
+        }
+        await sendAlert('Waitlist thanks bounced — signup removed', [
+          `To: ${event.data?.to?.join(', ') ?? 'unknown'}`,
+          `Submission: ${row.id} (form ${row.formId})`,
+          'The visitor address is bad; it was removed from the list and the Resend Audience.',
+        ]);
+        break;
+      }
+
+      // Client notification bounce — the fix is a human one: correct the
+      // recipient in the form config.
       await sendAlert('Email bounced', [
         `To: ${event.data?.to?.join(', ') ?? 'unknown'}`,
         `Subject: ${event.data?.subject ?? 'unknown'}`,
@@ -171,6 +273,17 @@ app.post('/webhooks/resend', async (c) => {
       break;
     }
     case 'email.failed': {
+      // Auto-replies are best-effort with no retry — don't touch the
+      // submission status (the client notification already succeeded).
+      const autoReplyRow = emailId ? await findByAutoReplyEmailId(emailId) : null;
+      if (autoReplyRow) {
+        await sendAlert('Auto-reply delivery failed (not retried)', [
+          `To: ${event.data?.to?.join(', ') ?? 'unknown'}`,
+          `Submission: ${autoReplyRow.id} (form ${autoReplyRow.formId})`,
+          'The confirmation is best-effort; the client notification was delivered.',
+        ]);
+        break;
+      }
       const row = emailId ? await setStatusByEmailId(emailId, 'failed') : null;
       await sendAlert('Email delivery failed', [
         `To: ${event.data?.to?.join(', ') ?? 'unknown'}`,
@@ -219,7 +332,10 @@ app.get('/cron/retry', async (c) => {
     }
 
     try {
-      const emailId = await sendNotification(form, row.payload, row.id);
+      const emailId =
+        form.kind === 'waitlist'
+          ? await sendWaitlistThanks(form, row.payload)
+          : await sendNotification(form, row.payload, row.id);
       await markSent(row.id, emailId);
       sent++;
     } catch (err) {
@@ -235,7 +351,19 @@ app.get('/cron/retry', async (c) => {
     }
   }
 
-  return c.json({ ok: true, eligible: rows.length, sent, failed });
+  // ── Audience sync sweep: signups whose Resend contact push failed. ────────
+  const unsynced = await getUnsyncedSignups();
+  let synced = 0;
+  for (const signup of unsynced) {
+    const audienceId = formRegistry[signup.formId]?.waitlist?.audienceId;
+    if (!audienceId) continue; // form removed or no longer a waitlist
+    if (await syncAudienceContact(audienceId, signup.email, signup.name)) {
+      await markContactSynced(signup.id);
+      synced++;
+    }
+  }
+
+  return c.json({ ok: true, eligible: rows.length, sent, failed, synced });
 });
 
 // ── Weekly digest (Vercel Cron, Mondays): per-form counts + stuck rows ──────
@@ -281,6 +409,15 @@ app.get('/cron/digest', async (c) => {
     lines.push('Blocked requests (last 7 days):');
     for (const s of spamStats) {
       lines.push(`  ${s.formId}: ${s.count} × ${s.reason}`);
+    }
+  }
+
+  const waitlistForms = Object.values(formRegistry).filter((f) => f.kind === 'waitlist');
+  if (waitlistForms.length > 0) {
+    lines.push('');
+    lines.push('Waitlists (total size):');
+    for (const f of waitlistForms) {
+      lines.push(`  ${f.id}: ${await countWaitlistSignups(f.id)}`);
     }
   }
 

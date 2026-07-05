@@ -18,6 +18,23 @@
  *     created_at      timestamptz NOT NULL DEFAULT now(),
  *     sent_at         timestamptz
  *   );
+ *
+ *   -- Auto-reply upgrade: a bounced VISITOR address (auto-reply) must never
+ *   -- be confused with a bounced CLIENT notification, so the confirmation's
+ *   -- Resend id lives in its own column.
+ *   ALTER TABLE submissions ADD COLUMN auto_reply_email_id text;
+ *
+ *   -- Waitlist signups: the source of truth for list membership. The Resend
+ *   -- Audience is a downstream copy (contact_synced tracks the push).
+ *   CREATE TABLE waitlist_signups (
+ *     id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ *     form_id        text NOT NULL,
+ *     email          text NOT NULL,                  -- stored lowercased
+ *     name           text,
+ *     contact_synced boolean NOT NULL DEFAULT false, -- pushed to Resend Audience yet?
+ *     created_at     timestamptz NOT NULL DEFAULT now(),
+ *     UNIQUE (form_id, email)
+ *   );
  */
 
 import { neon, type NeonQueryFunction } from '@neondatabase/serverless';
@@ -235,6 +252,137 @@ export async function getExhausted(maxAttempts: number): Promise<
     formId: r.form_id as string,
     createdAt: String(r.created_at),
   }));
+}
+
+/** Records the Resend id of the best-effort auto-reply (visitor confirmation). */
+export async function setAutoReplyEmailId(id: string, emailId?: string): Promise<void> {
+  const db = getSql();
+  if (!db || !isDurable(id) || !emailId) return;
+  try {
+    await db`
+      UPDATE submissions SET auto_reply_email_id = ${emailId} WHERE id = ${id}::uuid
+    `;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'db-update-failed', id, error: String(err) }));
+  }
+}
+
+/** Webhook lookup: was this Resend email an auto-reply (visitor confirmation)? */
+export async function findByAutoReplyEmailId(
+  emailId: string
+): Promise<{ id: string; formId: string } | null> {
+  const db = getSql();
+  if (!db) return null;
+  const rows = await db`
+    SELECT id, form_id FROM submissions
+    WHERE auto_reply_email_id = ${emailId}
+    LIMIT 1
+  `;
+  const row = rows[0] as { id: string; form_id: string } | undefined;
+  return row ? { id: row.id, formId: row.form_id } : null;
+}
+
+/** True when this (lowercased) address already joined the form's waitlist.
+ *  Fails open → false: without a database there is no dedupe, but delivery
+ *  still works. */
+export async function hasWaitlistSignup(formId: string, email: string): Promise<boolean> {
+  const db = getSql();
+  if (!db) return false;
+  try {
+    const rows = await db`
+      SELECT 1 FROM waitlist_signups
+      WHERE form_id = ${formId} AND email = ${email}
+      LIMIT 1
+    `;
+    return rows.length > 0;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'db-query-failed', formId, error: String(err) }));
+    return false;
+  }
+}
+
+/** Inserts a waitlist signup; null on duplicate (race with hasWaitlistSignup)
+ *  or when the database is unavailable — callers treat both as "skip sync". */
+export async function insertWaitlistSignup(
+  formId: string,
+  email: string,
+  name?: string
+): Promise<string | null> {
+  const db = getSql();
+  if (!db) return null;
+  try {
+    const rows = await db`
+      INSERT INTO waitlist_signups (form_id, email, name)
+      VALUES (${formId}, ${email}, ${name ?? null})
+      ON CONFLICT (form_id, email) DO NOTHING
+      RETURNING id
+    `;
+    return (rows[0] as { id: string } | undefined)?.id ?? null;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'db-insert-failed', formId, error: String(err) }));
+    return null;
+  }
+}
+
+export async function markContactSynced(id: string): Promise<void> {
+  const db = getSql();
+  if (!db) return;
+  try {
+    await db`
+      UPDATE waitlist_signups SET contact_synced = true WHERE id = ${id}::uuid
+    `;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'db-update-failed', id, error: String(err) }));
+  }
+}
+
+export interface UnsyncedSignup {
+  id: string;
+  formId: string;
+  email: string;
+  name?: string;
+}
+
+/** Signups whose Resend Audience push failed at signup time (cron sweep). */
+export async function getUnsyncedSignups(limit = 25): Promise<UnsyncedSignup[]> {
+  const db = getSql();
+  if (!db) return [];
+  const rows = await db`
+    SELECT id, form_id, email, name
+    FROM waitlist_signups
+    WHERE contact_synced = false
+    ORDER BY created_at
+    LIMIT ${limit}
+  `;
+  return rows.map((r) => ({
+    id: r.id as string,
+    formId: r.form_id as string,
+    email: r.email as string,
+    name: (r.name as string | null) ?? undefined,
+  }));
+}
+
+/** Total list size for a form (weekly digest). */
+export async function countWaitlistSignups(formId: string): Promise<number> {
+  const db = getSql();
+  if (!db) return 0;
+  const rows = await db`
+    SELECT count(*)::int AS n FROM waitlist_signups WHERE form_id = ${formId}
+  `;
+  return (rows[0] as { n: number }).n;
+}
+
+/** Removes a bounced address from the list (rule 5: bounced addresses get
+ *  fixed or removed). A later re-signup with a working mailbox is welcome. */
+export async function deleteWaitlistSignup(formId: string, email: string): Promise<boolean> {
+  const db = getSql();
+  if (!db) return false;
+  const rows = await db`
+    DELETE FROM waitlist_signups
+    WHERE form_id = ${formId} AND email = ${email}
+    RETURNING id
+  `;
+  return rows.length > 0;
 }
 
 /**
