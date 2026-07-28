@@ -37,6 +37,7 @@ function WaitlistCommission({
   ] });
 }
 WaitlistCommission.PreviewProps = {
+  accentColor: "#8db3dd",
   logoUrl: "https://form-relay-eta.vercel.app/tnma.png",
   body: [
     "Thanks for signing up \u2014 you're on the list.",

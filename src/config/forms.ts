@@ -180,10 +180,10 @@ const forms: FormConfig[] = [
   {
     id: 'tnma-bag-waitlist',
     kind: 'waitlist',
-    clientName: 'Bags by TNMA',
+    clientName: 'TNMA Commission',
     to: ['tommyonik@gmail.com'],
     subjectTemplate: 'New bag waitlist signup: {{email}}', // unused for waitlists
-    accentColor: '#8a3324',
+    accentColor: '#8db3dd',
     logoUrl: 'https://form-relay-eta.vercel.app/tnma.png',
     redirectUrl: 'https://commission.tnma.me/?waitlist=1',
     allowedOrigins: ['https://commission.tnma.me'],

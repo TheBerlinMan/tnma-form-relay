@@ -76,7 +76,11 @@ export default function WaitlistCommission({
   );
 }
 
+// Mirror the registry entry, including accentColor — sendWaitlistThanks always
+// passes form.accentColor explicitly, so omitting it here would preview the
+// component default and quietly hide a mismatched value in the config.
 WaitlistCommission.PreviewProps = {
+  accentColor: '#8db3dd',
   logoUrl: 'https://form-relay-eta.vercel.app/tnma.png',
   body: [
     "Thanks for signing up — you're on the list.",

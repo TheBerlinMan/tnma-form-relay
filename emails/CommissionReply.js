@@ -38,6 +38,7 @@ function CommissionReply({
 }
 CommissionReply.PreviewProps = {
   visitorName: "Ana",
+  accentColor: "#8db3dd",
   logoUrl: "https://form-relay-eta.vercel.app/tnma.png",
   body: [
     "Thanks for submitting the survey. I've got your response.",
