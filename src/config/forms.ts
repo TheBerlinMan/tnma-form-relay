@@ -24,6 +24,13 @@ export interface AutoReplyConfig {
   body: string[];
   /** Where visitor replies to the confirmation go. Defaults to `to[0]`. */
   replyTo?: string;
+  /**
+   * Which React Email template renders the confirmation. Omit for the neutral
+   * multi-client `AutoReply`. Add a value here only when a form's voice is
+   * genuinely its own — a bespoke template beats bending the shared one with
+   * per-form copy knobs, which leak that voice into every other client.
+   */
+  template?: 'commission';
 }
 
 export interface WaitlistConfig {
@@ -36,6 +43,11 @@ export interface WaitlistConfig {
   thanksSubject?: string;
   /** Paragraphs of the thanks body. Sensible default if omitted. */
   thanksBody?: string[];
+  /**
+   * Which React Email template renders the thanks. Omit for the neutral
+   * multi-client `WaitlistThanks` (the one with the promo-code block).
+   */
+  template?: 'commission';
 }
 
 export interface FormConfig {
@@ -114,6 +126,82 @@ const forms: FormConfig[] = [
       { name: 'name', label: 'Name', type: 'text', required: true, maxLength: 200 },
       { name: 'email', label: 'Email', type: 'email', required: true },
       { name: 'message', label: 'Message', type: 'textarea', required: true, maxLength: 5000 },
+    ],
+  },
+
+  // ── commission.tnma.me — Bags by TNMA commission survey ─────────────────
+  // Slide-deck survey (TheBerlinMan/tnma-commission-form) POSTing JSON. Every
+  // value arrives as a string: multi-selects are comma-joined and the two
+  // computed numbers are sent as numeric strings, both by the client.
+  {
+    id: 'tnma-bag-commission',
+    clientName: 'TNMA Commission',
+    to: ['tommyonik@gmail.com'],
+    subjectTemplate: 'New bag commission from {{name}} (${{depositTotal}} deposit)',
+    accentColor: '#8db3dd',
+    logoUrl: 'https://form-relay-eta.vercel.app/tnma.png',
+    redirectUrl: 'https://commission.tnma.me/?sent=1',
+    allowedOrigins: ['https://commission.tnma.me'],
+    dailyCap: 50, // a handful of spots per round — real volume is tiny
+    replyToField: 'email',
+    autoReply: {
+      subject: 'I received your bag commission survey',
+      template: 'commission',
+      body: [
+        "Thanks for submitting the survey. I've got your response.",
+        "Please don't forget to submit the deposit as your spot cannot be confirmed until then. You can find me on Venmo or Zelle at (201) 300-7370.",
+      ],
+    },
+    fields: [
+      { name: 'name', label: 'Name', type: 'text', required: true, maxLength: 200 },
+      { name: 'email', label: 'Email', type: 'email', required: true },
+      { name: 'phone', label: 'Phone', type: 'phone', maxLength: 40 },
+      { name: 'usage', label: 'Primary use', type: 'text', maxLength: 200 },
+      { name: 'bagSize', label: 'Preferred size', type: 'text', required: true, maxLength: 40 },
+      { name: 'heaviestItem', label: 'Heaviest item', type: 'text', required: true, maxLength: 200 },
+      { name: 'specificFit', label: 'Needs to fit', type: 'text', maxLength: 200 },
+      { name: 'favoriteColors', label: 'Favorite colors', type: 'text', required: true, maxLength: 200 },
+      { name: 'dislikedColors', label: 'Colors to avoid', type: 'text', maxLength: 200 },
+      { name: 'allergies', label: 'Fabric allergies', type: 'text', maxLength: 200 },
+      { name: 'additionalPreferences', label: 'Additional preferences', type: 'textarea', maxLength: 5000 },
+      { name: 'instaMatch', label: 'Match an Insta bag', type: 'text', required: true, maxLength: 10 },
+      { name: 'instaBag', label: 'Matched bag', type: 'text', maxLength: 20 },
+      { name: 'tattoo', label: 'Tattoo embroidery', type: 'text', required: true, maxLength: 10 },
+      { name: 'tattooPicks', label: 'Tattoo selections', type: 'text', maxLength: 200 },
+      { name: 'tattooCount', label: 'Tattoo count', type: 'number' },
+      { name: 'depositTotal', label: 'Deposit total ($)', type: 'number' },
+    ],
+  },
+
+  // ── commission.tnma.me — waitlist (shown once all spots are filled) ──────
+  // No notification is sent for kind:'waitlist' — the signup lands in Neon,
+  // the Resend Audience, and the Monday digest. `to[0]` is still load-bearing:
+  // it becomes the Reply-To on the visitor's thanks email.
+  {
+    id: 'tnma-bag-waitlist',
+    kind: 'waitlist',
+    clientName: 'Bags by TNMA',
+    to: ['tommyonik@gmail.com'],
+    subjectTemplate: 'New bag waitlist signup: {{email}}', // unused for waitlists
+    accentColor: '#8a3324',
+    logoUrl: 'https://form-relay-eta.vercel.app/tnma.png',
+    redirectUrl: 'https://commission.tnma.me/?waitlist=1',
+    allowedOrigins: ['https://commission.tnma.me'],
+    dailyCap: 100,
+    waitlist: {
+      audienceId: '9580eeef-2be6-4750-a473-ef5a5c63ce22', // Resend Dashboard → Audiences
+      template: 'commission',
+      thanksSubject: "You're on the bag commission waitlist",
+      thanksBody: [
+        "Thanks for signing up — you're on the list.",
+        "If a spot opens up in this round, or when the next round of commissions opens, you'll hear from me here.",
+      ],
+    },
+    fields: [
+      // The closed-spots view asks for an email only; `name` stays declared as
+      // optional so it degrades to null/undefined all the way down.
+      { name: 'email', label: 'Email', type: 'email', required: true },
+      { name: 'name', label: 'Name', type: 'text', maxLength: 200 },
     ],
   },
 

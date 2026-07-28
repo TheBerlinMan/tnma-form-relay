@@ -2,7 +2,9 @@ import { Resend } from 'resend';
 import { render } from '@react-email/components';
 import DefaultNotification from '../../emails/DefaultNotification.js';
 import AutoReply from '../../emails/AutoReply.js';
+import CommissionReply from '../../emails/CommissionReply.js';
 import WaitlistThanks from '../../emails/WaitlistThanks.js';
+import WaitlistCommission from '../../emails/WaitlistCommission.js';
 import type { FormConfig } from '../config/forms.js';
 import { waitlistEmailField } from '../config/forms.js';
 import { renderSubject } from './validate.js';
@@ -88,8 +90,9 @@ export async function sendAutoReply(
   data: Record<string, string>
 ): Promise<string | undefined> {
   const autoReply = form.autoReply!;
+  const Template = autoReply.template === 'commission' ? CommissionReply : AutoReply;
   const html = await render(
-    AutoReply({
+    Template({
       clientName: form.clientName,
       visitorName: data.name,
       body: autoReply.body,
@@ -116,18 +119,28 @@ export async function sendWaitlistThanks(
   data: Record<string, string>
 ): Promise<string | undefined> {
   const waitlist = form.waitlist!;
+  const body = waitlist.thanksBody ?? [
+    "Thanks for signing up — you're on the list.",
+    "We'll only email you when there's something worth hearing about.",
+  ];
   const html = await render(
-    WaitlistThanks({
-      clientName: form.clientName,
-      visitorName: data.name,
-      body: waitlist.thanksBody ?? [
-        "Thanks for signing up — you're on the list.",
-        "We'll only email you when there's something worth hearing about.",
-      ],
-      promoCode: waitlist.promoCode,
-      accentColor: form.accentColor,
-      logoUrl: form.logoUrl,
-    })
+    waitlist.template === 'commission'
+      ? // No promoCode: the commission waitlist has nothing to discount.
+        WaitlistCommission({
+          clientName: form.clientName,
+          visitorName: data.name,
+          body,
+          accentColor: form.accentColor,
+          logoUrl: form.logoUrl,
+        })
+      : WaitlistThanks({
+          clientName: form.clientName,
+          visitorName: data.name,
+          body,
+          promoCode: waitlist.promoCode,
+          accentColor: form.accentColor,
+          logoUrl: form.logoUrl,
+        })
   );
 
   const { data: sent, error } = await resendClient().emails.send({
