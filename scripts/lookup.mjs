@@ -43,6 +43,8 @@ form-relay submission lookup
   npm run lookup -- --limit 50                show more rows
   npm run lookup -- --id <uuid>               full detail for one submission
   npm run lookup -- --resend <uuid> [--force] re-send a submission's email
+  npm run lookup -- --waitlist                waitlist signups, in signup order
+                                              (combine with --form/--since/--until)
 `;
 
 const { values: args } = parseArgs({
@@ -54,6 +56,7 @@ const { values: args } = parseArgs({
     search: { type: 'string' },
     id: { type: 'string' },
     resend: { type: 'string' },
+    waitlist: { type: 'boolean', default: false },
     force: { type: 'boolean', default: false },
     limit: { type: 'string', default: '20' },
     help: { type: 'boolean', default: false },
@@ -152,6 +155,72 @@ if (args.resend) {
   const after = await sql.query('SELECT * FROM submissions WHERE id = $1::uuid', [args.resend]);
   printDetail(after[0]);
   process.exit(after[0].status === 'sent' ? 0 : 1);
+}
+
+// ── --waitlist: signups in the order they arrived ───────────────────────────
+// Position comes from created_at, which is stamped by the INSERT — and the
+// insert runs BEFORE the Audience sync and the thanks email, so it records
+// signup time, not delivery time. (Resend's own contact created_at reflects
+// when the sync landed, which a failed sync can delay by a whole cron cycle,
+// so it is not a safe ordering key.) `id` breaks ties within the same instant.
+//
+// The numbering is computed over every row for the form and filtered only
+// afterwards, so --since/--until narrow what you SEE without renumbering it:
+// signup #40 stays #40 in a filtered view.
+if (args.waitlist) {
+  const filters = [];
+  const values = [];
+  const push = (clause, value) => {
+    values.push(value);
+    filters.push(clause.replace('?', `$${values.length}`));
+  };
+
+  if (args.form) push('form_id = ?', args.form);
+  if (args.since) push('created_at >= ?::date', args.since);
+  if (args.until) push("created_at < ?::date + interval '1 day'", args.until);
+  // One value, referenced twice — `push` only substitutes the first `?`.
+  if (args.search) {
+    values.push(`%${args.search}%`);
+    filters.push(`(email ILIKE $${values.length} OR coalesce(name, '') ILIKE $${values.length})`);
+  }
+
+  const max = Math.min(parseInt(args.limit, 10) || 20, 200);
+  const signups = await sql.query(
+    `
+    SELECT * FROM (
+      SELECT id, form_id, email, name, contact_synced, created_at,
+             ROW_NUMBER() OVER (PARTITION BY form_id ORDER BY created_at, id) AS position
+      FROM waitlist_signups
+    ) ranked
+    ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+    ORDER BY form_id, position
+    LIMIT ${max}
+  `,
+    values
+  );
+
+  if (!signups.length) {
+    console.log('No matching waitlist signups.');
+  } else {
+    console.table(
+      signups.map((row) => ({
+        '#': Number(row.position),
+        form: row.form_id,
+        email: row.email,
+        name: row.name ?? '—',
+        // contact_synced=false is not data loss: the row is the source of
+        // truth and /cron/retry re-pushes it to the Resend Audience.
+        synced: row.contact_synced ? 'yes' : 'NO',
+        signed_up: new Date(row.created_at).toISOString().replace('T', ' ').slice(0, 16),
+      }))
+    );
+    const unsynced = signups.filter((row) => !row.contact_synced).length;
+    console.log(
+      `${signups.length} signup${signups.length === 1 ? '' : 's'}.` +
+        (unsynced ? ` ${unsynced} not yet in the Resend Audience — /cron/retry will push them.` : '')
+    );
+  }
+  process.exit(0);
 }
 
 // ── default: filtered list ──────────────────────────────────────────────────

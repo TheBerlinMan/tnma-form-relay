@@ -236,6 +236,26 @@ Flags combine freely, e.g. `--form tnma-contact --status failed --since
 2026-06-01`. Output is a table: id, form, status, attempt count, created
 timestamp, sender name/email, and the start of the message.
 
+### Waitlist signups, in signup order
+
+```bash
+npm run lookup -- --waitlist                          # every waitlist, numbered
+npm run lookup -- --waitlist --form tnma-bag-waitlist # one waitlist
+```
+
+Queries `waitlist_signups` instead of `submissions` and adds a `#` column: who
+was first. Position comes from `created_at`, which the INSERT stamps *before*
+the Audience sync and the thanks email — so it is signup time, not delivery
+time. Resend's own contact `created_at` records when the sync landed, which a
+failed sync can delay by a whole cron cycle, so it is not a safe ordering key.
+
+Numbering is computed over every row for the form and filtered afterwards, so
+`--since`/`--until`/`--search` narrow what you see without renumbering it:
+signup #40 stays #40 in a filtered view. Each form is numbered independently.
+
+The `synced` column is whether the contact reached the Resend Audience. `NO` is
+not data loss — the row is the source of truth and `/cron/retry` re-pushes it.
+
 ### Full detail for one submission
 
 ```bash
