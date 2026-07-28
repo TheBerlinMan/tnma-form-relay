@@ -40,14 +40,54 @@ const DEFAULT_DAILY_CAP = 200;
 
 const app = new Hono().basePath('/');
 
+/**
+ * Does a request's Origin (or Referer, for no-CORS HTML form posts) match an
+ * allowlist?
+ *
+ * Matching is EXACT on scheme + host + port. A prefix test would be a hole:
+ * "https://tnma.me.attacker.com".startsWith("https://tnma.me") is true, so an
+ * attacker only needs a hostname that begins with yours.
+ *
+ * One deliberate exception: a loopback entry ("http://localhost") matches that
+ * host on ANY port, so a single entry covers every local dev server while
+ * testing. Remove it before go-live like any other origin.
+ */
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+function originAllowed(allowed: string[], originHeader: string, referer = ''): boolean {
+  // A page loaded over file:// sends the literal "null" — unparseable, so it
+  // can never match, which is what we want.
+  let url: URL;
+  try {
+    url = new URL(originHeader || referer);
+  } catch {
+    return false;
+  }
+  const origin = url.origin; // normalises a full Referer URL down to its origin
+
+  return allowed.some((entry) => {
+    if (entry === origin) return true;
+    try {
+      const a = new URL(entry);
+      return (
+        LOOPBACK.has(a.hostname) &&
+        a.hostname === url.hostname &&
+        a.protocol === url.protocol
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
 // CORS for fetch()-based form submissions: reflect the origin only when some
 // registered form allows it. Per-form origin enforcement still happens in the
 // route — this just lets the browser read the JSON response.
-const knownOrigins = new Set(Object.values(formRegistry).flatMap((f) => f.allowedOrigins));
+const knownOrigins = [...new Set(Object.values(formRegistry).flatMap((f) => f.allowedOrigins))];
 app.use(
   '/f/*',
   cors({
-    origin: (origin) => (knownOrigins.has(origin) ? origin : undefined),
+    origin: (origin) => (originAllowed(knownOrigins, origin) ? origin : undefined),
     allowHeaders: ['Content-Type', 'Accept'],
   })
 );
@@ -78,9 +118,11 @@ app.post('/f/:formId', async (c) => {
 
   // ── Origin check ──────────────────────────────────────────────────────────
   if (form.allowedOrigins.length > 0) {
-    const origin = c.req.header('origin') ?? c.req.header('referer') ?? '';
-    const allowed = form.allowedOrigins.some((o) => origin.startsWith(o));
-    if (!allowed) return c.json({ ok: false, error: 'Origin not allowed' }, 403);
+    const origin = c.req.header('origin') ?? '';
+    const referer = c.req.header('referer') ?? '';
+    if (!originAllowed(form.allowedOrigins, origin, referer)) {
+      return c.json({ ok: false, error: 'Origin not allowed' }, 403);
+    }
   }
 
   // ── Rate limit, then spam checks: both get a FAKE SUCCESS (never tip off
